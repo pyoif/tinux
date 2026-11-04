@@ -1,135 +1,116 @@
-# qemu-linux-tiny
+# tiny-linux — a pocket Linux that gives memory back to Android
 
-A tiny aarch64 Linux appliance for terminal emulators on Android
-(but it boots anywhere `qemu-system-aarch64` exists):
-
-- **Image.gz ≈ 2.2 MB** — Linux 6.12 built from `tinyconfig` + a small
-  virtio fragment, cross-compiled in GitHub Actions
-- **initramfs ≈ 1.2 MB** — static busybox, ~400 applets, boots to a root
-  shell in a few seconds
-- QEMU's `-M virt` + `-nographic`: the serial console **is** your terminal
-- **free page reporting** — when the guest frees memory, QEMU hands the
-  pages back to the host within seconds, automatically
-
-Everything here was built and boot-tested end to end:
-the guest booted, got an IP over QEMU's user-mode NAT, mounted the host
-share over 9p, and freeing 100 MB inside the guest shrank the QEMU
-process by ~96 MB on the host — no ballooning commands involved.
+A ~2–3 MB aarch64 kernel plus a ~1 MB busybox initramfs, built entirely in
+GitHub Actions and booted with QEMU from Termux. The guest runs with a
+virtio-balloon that has **free page reporting** enabled, so whenever the guest
+frees memory, QEMU hands those pages straight back to Android — no manual
+ballooning, no phantom RSS, no angry lmkd.
 
 ## Quick start
 
-1. Push this repo to GitHub → **Actions** → run the **kernel** workflow →
-   download the `qemu-linux-tiny` artifact (`Image.gz`, `initramfs.cpio.gz`,
-   `.config`). Artifacts expire after 90 days — push a `v*` tag to also get
-   a Release with the files attached.
-2. On the phone (Termux):
+1. Push this repo to GitHub (branch `main` or `master`, both trigger CI).
+   The `kernel` workflow runs in ~5–8 minutes and **boots the kernel in QEMU
+   on the runner** before you download anything.
+2. Grab the output: Actions → latest run → artifact `qemu-linux-aarch64`,
+   or push a tag like `v0.1` and get a proper GitHub Release.
+3. On the phone, in Termux:
 
    ```sh
-   pkg install qemu-system-aarch64 git
-   git clone https://github.com/you/qemu-linux-tiny && cd qemu-linux-tiny
-   mkdir vm && unzip qemu-linux-tiny.zip -d vm   # the artifact
-   ./scripts/boot.sh                              # shares $HOME/vm-share
+   pkg install qemu-system-aarch64 unzip
+   unzip qemu-linux-aarch64.zip
+   sh run.sh
    ```
 
-3. Inside the guest:
-
-   ```sh
-   ls /mnt/host      # the folder shared from Android (9p)
-   poweroff          # clean exit (PSCI SYSTEM_OFF, QEMU just stops)
-   ```
+You land in a root shell on the serial console (`ttyAMA0`).
 
 ## Repo layout
 
 ```
-.github/workflows/kernel.yml   CI: build + boot-test + artifact + release
-kernel/virt-tiny.config        kconfig fragment merged over tinyconfig
-scripts/check-fragment.sh       CI guard: fails if an option got dropped
-scripts/boot.sh                 QEMU launcher for Termux / desktop
-scripts/rss-watch.sh            watch qemu RSS to see reclaim happen
-rootfs/build-initramfs.sh       builds static busybox, packs initramfs
-rootfs/init                    guest /init (PID 1 -> busybox init)
-rootfs/inittab                 console shell respawn setup
-rootfs/rcS                     mounts, DHCP, 9p, prints BOOT-OK
-rootfs/udhcpc.script           tiny DHCP event handler
+.
+├── .github/workflows/kernel.yml  # build + smoke boot + artifact/release
+├── kernel/virt-tiny.config       # the whole kernel config, on top of tinyconfig
+├── scripts/
+│   ├── check-fragment.sh         # fails CI if kconfig drops a requested option
+│   ├── mkinitramfs.sh            # packs busybox + /init into rootfs.cpio.gz
+│   ├── init                      # guest /init (PID 1)
+│   └── udhcpc.script             # applies the DHCP lease QEMU slirp hands out
+├── run.sh                        # Termux launcher (balloon + free-page-reporting on)
+└── README.md
 ```
 
 ## What CI does
 
-1. Shallow-clones a stable branch (`linux-6.12.y` — override via the
-   workflow_dispatch input; bump to the current LTS when it goes EOL).
-2. `tinyconfig` + `kernel/virt-tiny.config` → `olddefconfig`, then
-   `check-fragment.sh` fails the build if any requested option was silently
-   dropped because of a missing Kconfig dependency.
-3. Builds `Image.gz` with clang (LLVM=1).
-4. Cross-builds static busybox and packs the initramfs.
-5. **Boots the result in QEMU on the runner** and requires the guest to
-   print `BOOT-OK`, `NET-OK`, `9P-OK`, and no panic. A broken kernel
-   can never produce a green check.
+1. `make ARCH=arm64 tinyconfig`, then merges `kernel/virt-tiny.config` on top.
+2. `scripts/check-fragment.sh` fails the build if kconfig **silently dropped**
+   any requested option (unmet dependency) — this catches a missing console or
+   balloon *before* the compile.
+3. Builds `Image.gz` with clang + lld (no external cross toolchain).
+4. Cross-compiles static busybox with `gcc-aarch64-linux-gnu`.
+5. `scripts/mkinitramfs.sh` packs busybox + `/init` into `rootfs.cpio.gz`.
+6. **Smoke test**: boots the result in QEMU right on the runner — balloon
+   attached — and greps the guest banner out of the serial log.
+7. Uploads `Image.gz`, `rootfs.cpio.gz`, `run.sh` and `boot.log`.
 
-## Memory: automatic reclaim
+## Memory behavior (the whole point)
 
-`boot.sh` attaches `-device virtio-balloon-device,free-page-reporting=on`
-and the kernel builds in `CONFIG_VIRTIO_BALLOON=y` + `CONFIG_PAGE_REPORTING=y`.
-The guest kernel periodically walks its free-page lists and hands free pages
-to QEMU, which `madvise(MADV_DONTNEED)`s them — the host OS reclaims them
-from the QEMU process immediately. There is nothing to drive: no balloon
-targets, no monitor commands, no OOM risk (pages only leave once the guest
-has already freed them).
+- `-m 256M` is a **cap**, not a reservation. QEMU's RSS only grows to what the
+  guest actually touches (its high-water mark) and is fully returned when the
+  process exits.
+- With `free-page-reporting=on`, pages the guest kernel frees back to its buddy
+  allocator are reported through the balloon and QEMU `madvise(MADV_DONTNEED)`s
+  them — Android RSS drops **automatically**, within a second or so.
+- **Not covered**: guest page cache. Only genuinely free buddy pages get
+  reported; files cached in the guest stay in RSS until the guest drops them.
+- Manual ballooning still works: `Ctrl-A c` → monitor → `balloon 128M`
+  (HMP numbers are megabytes; QMP numbers are bytes).
+- Want a bigger guest? Raise `-m` in `run.sh` (e.g. `-m 1G`) — untouched
+  memory never leaves Android anyway.
 
-Measured on QEMU 10 / kernel 6.12 (256M guest, RSS of the QEMU process):
+Verify from another Termux session:
 
+```sh
+grep VmRSS /proc/$(pidof qemu-system-aarch64)/status
 ```
-idle                    ~112 MiB
-dd 100 MB in guest     ~216 MiB
-after rm (seconds)     ~122 MiB   <- -96 MiB, automatic
+
+then inside the guest:
+
+```sh
+dd if=/dev/zero of=/tmp/junk bs=1M count=100; rm /tmp/junk
 ```
 
-Watch it live with `scripts/rss-watch.sh`. Two caveats:
+Re-check `VmRSS` — it climbs ~100 MB and falls back on its own after `rm`.
 
-- Only *free* pages are returned; guest page cache is not "free", so a
-  cache-heavy workload holds its share. Manual ballooning (QEMU monitor,
-  `balloon 128M` — MB in HMP, bytes in QMP) is still there if you ever
-  need to squeeze cache too.
-- Do not enable `CONFIG_PAGE_POISONING` in the guest — QEMU skips
-  reported pages when the guest poisons freed pages.
+## Optional: mount your Termux home in the guest
 
-## Terminal emulator notes
+Add to `run.sh` before `-nographic`:
 
-- With `-nographic`, the monitor is muxed onto the same stdio:
-  **Ctrl-A c** switches console ↔ monitor, **Ctrl-A x** quits QEMU,
-  and guest bash's Ctrl-A (beginning-of-line) needs **Ctrl-A a** to pass
-  through. Your app must forward these raw.
-- Ctrl-A b sends a break; boot.sh passes `-no-reboot` so a guest `reboot`
-  exits QEMU instead of restarting.
-- If the device exposes `/dev/kvm`, boot.sh automatically switches to
-  `-enable-kvm -cpu host` (near-native). Most phones don't.
-- 128–256 MB of guest RAM is plenty; keep `-m` modest — Android's lmkd
-  targets big processes under memory pressure.
+```sh
+    -fsdev local,id=share,path="$HOME",security_model=none \
+    -device virtio-9p-device,fsdev=share,mount_tag=host \
+```
 
-## Tuning
+then in the guest:
 
-- Size: add/remove options in `kernel/virt-tiny.config`. Keep
-  `check-fragment.sh` green — it is the difference between "config I
-  believe works" and "config that works". The CI-built `.config` is inside
-  the artifact for reference.
-- A real distro instead of busybox: unpack an Alpine minirootfs into a
-  directory, or keep this kernel and switch the rootfs to an ext4 image
-  (`-drive if=none,...,id=hd0 -device virtio-blk-device,drive=hd0` +
-  `root=/dev/vda`). Kernel already has EXT4 + virtio-blk built in.
-- CPU/RAM: `-smp` / `-m` in `scripts/boot.sh`.
-- The initramfs is RAM-only; changes inside the VM do not persist across
-  boots. Use `/mnt/host` (9p share) for anything you want to keep.
+```sh
+mkdir -p /mnt/host && mount -t 9p -o trans=virtio host /mnt/host
+```
 
 ## Troubleshooting
 
-- `qemu-system-aarch64: failed to find romfile "efi-virtio.rom"` — you are
-  using a QEMU without its data files and no explicit network device
-  (QEMU tries to add a default NIC with an option ROM). Reinstall QEMU
-  properly, or pass `-nic none` if you want no network.
-- Nothing appears on the serial console — did the artifact unzip into
-  `./vm/`? Check the paths `boot.sh` prints on startup.
-- `balloon` units: HMP `balloon 128` means 128 MB, QMP's `balloon` takes
-  bytes — always type `balloon 128M` in the HMP monitor.
-- Kernel branch EOL — see https://endoflife.date/linux, change the branch
-  in the workflow input, and let `check-fragment.sh` + the boot smoke
-  test catch any config regressions.
+- **`Permission denied` / exit 126 on a script** — the file was committed
+  without its executable bit (GitHub web editor / Windows). Fix it for good:
+
+  ```sh
+  git update-index --chmod=+x scripts/check-fragment.sh
+  git commit -m "scripts: fix exec bit" && git push
+  ```
+
+  This repo also invokes every script as `bash scripts/...`, so the exec bit
+  can never break CI again.
+- **`MISSING CONFIG_...` from check-fragment** — that option's dependency
+  isn't met. Look the symbol up in the kernel's Kconfig and add whatever it
+  `depends on` to the fragment.
+- **Smoke test failed** — download the artifact and read `boot.log`
+  (the upload runs even on failure).
+- **Bumping the kernel** — change the branch in the workflow
+  (`linux-6.12.y` → any stable branch). Everything else stays the same.

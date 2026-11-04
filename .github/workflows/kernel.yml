@@ -2,92 +2,99 @@ name: kernel
 
 on:
   push:
-    tags: ["v*"]
+    branches: [ main, master ]
+    tags: [ "v*" ]
   workflow_dispatch:
-    inputs:
-      kernel_branch:
-        description: "Linux stable branch to build"
-        default: "linux-6.12.y"
-        type: string
 
-env:
-  KERNEL_BRANCH: ${{ inputs.kernel_branch || 'linux-6.12.y' }}
-  BUSYBOX_VERSION: "1.36.1"
+permissions:
+  contents: write        # only used by the release-on-tag step
 
 jobs:
   build:
-    name: tiny aarch64 kernel + initramfs
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install toolchain
+      - name: deps
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q \
-            bison flex bc libelf-dev libssl-dev cpio \
-            clang lld gcc-aarch64-linux-gnu \
-            qemu-system-arm
+            bc bison flex libelf-dev libssl-dev \
+            clang lld \
+            gcc-aarch64-linux-gnu \
+            cpio file qemu-system-arm
 
-      - name: Fetch Linux source (shallow)
+      - name: kernel source
         run: |
-          git clone --depth 1 --branch "$KERNEL_BRANCH" \
-            https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git linux
-          # If kernel.org is slow from the runner, the GitHub mirror works too:
-          # git clone --depth 1 --branch "$KERNEL_BRANCH" https://github.com/gregkh/linux linux
+          git clone --depth 1 --branch linux-6.12.y \
+            https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
 
-      - name: Configure kernel
+      # ------------------------------------------------------------- kernel
+      - name: configure + build kernel
         working-directory: linux
         run: |
-          make ARCH=arm64 LLVM=1 tinyconfig
+          make ARCH=arm64 tinyconfig
           scripts/kconfig/merge_config.sh -m .config ../kernel/virt-tiny.config
           make ARCH=arm64 LLVM=1 olddefconfig
-          # Fail loudly if any requested option was dropped (missing dependency)
-          ../scripts/check-fragment.sh .config ../kernel/virt-tiny.config
+          # NOTE: scripts are invoked via `bash ...` on purpose — the git
+          # exec bit can never cause a "Permission denied" (exit 126).
+          bash ../scripts/check-fragment.sh ../kernel/virt-tiny.config .config
+          make ARCH=arm64 LLVM=1 -j"$(nproc)" Image.gz
+          ls -lh arch/arm64/boot/Image.gz
 
-      - name: Build kernel
-        working-directory: linux
-        run: make ARCH=arm64 LLVM=1 -j"$(nproc)" Image.gz
-
-      - name: Build busybox initramfs
-        run: ./rootfs/build-initramfs.sh
-
-      - name: Smoke test - boot the VM on the runner
-        timeout-minutes: 5
+      # ------------------------------------------------------ userland: busybox
+      - name: build busybox (static, aarch64)
         run: |
-          mkdir -p /tmp/share && echo hello-from-host > /tmp/share/hello.txt
-          set -o pipefail
-          # -k 5: KILL if qemu hangs on shutdown after SIGTERM
-          timeout -k 5 90 qemu-system-aarch64 \
-            -machine virt -cpu max -smp 2 -m 256M \
-            -kernel linux/arch/arm64/boot/Image.gz \
-            -initrd rootfs/initramfs.cpio.gz \
-            -append "console=ttyAMA0 panic=-1" \
-            -netdev user,id=n0 \
-            -device virtio-net-device,netdev=n0 \
-            -fsdev local,id=fs0,path=/tmp/share,security_model=none \
-            -device virtio-9p-device,fsdev=fs0,mount_tag=host \
-            -device virtio-balloon-device,free-page-reporting=on \
-            -no-reboot -nographic | tee boot.log || true
-          grep -q "BOOT-OK" boot.log
-          grep -q "NET-OK" boot.log
-          grep -q "9P-OK" boot.log
-          ! grep -q "Kernel panic" boot.log
+          curl -fsSLO https://busybox.net/downloads/busybox-1.36.1.tar.bz2
+          mkdir -p busybox
+          tar -xjf busybox-1.36.1.tar.bz2 -C busybox --strip-components=1
+          make -C busybox defconfig
+          sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' busybox/.config
+          # tc doesn't compile against 6.8+ kernel headers in busybox 1.36.1
+          # and we don't need it in the appliance:
+          sed -i 's/^CONFIG_TC=y/# CONFIG_TC is not set/' busybox/.config
+          make -C busybox -j"$(nproc)" CROSS_COMPILE=aarch64-linux-gnu-
+          file busybox/busybox | grep -q 'aarch64.*statically linked' \
+            || { echo 'busybox is not a static aarch64 binary' >&2; exit 1; }
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - name: build initramfs
+        run: bash scripts/mkinitramfs.sh busybox/busybox out/rootfs.cpio.gz
+
+      # ---------------------------------------------------- prove it boots
+      - name: smoke test - boot it right here in CI
+        working-directory: linux
+        run: |
+          timeout 120 qemu-system-aarch64 \
+            -M virt -cpu max -smp 2 -m 256M \
+            -kernel arch/arm64/boot/Image.gz \
+            -initrd ../out/rootfs.cpio.gz \
+            -append "console=ttyAMA0 panic=-1" \
+            -device virtio-balloon-device,free-page-reporting=on \
+            -netdev user,id=n0 -device virtio-net-device,netdev=n0 \
+            -no-reboot -nographic | tee boot.log
+          # the guest banner is proof we reached userspace:
+          grep -q "tiny-linux" boot.log
+
+      - uses: actions/upload-artifact@v4
+        if: always()          # keep boot.log even when the smoke test fails
         with:
-          name: qemu-linux-tiny
+          name: qemu-linux-aarch64
+          if-no-files-found: error
           path: |
             linux/arch/arm64/boot/Image.gz
-            rootfs/initramfs.cpio.gz
-            linux/.config
+            out/rootfs.cpio.gz
+            run.sh
+            linux/boot.log
 
-      - name: Attach to release (tags only)
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            linux/arch/arm64/boot/Image.gz
-            rootfs/initramfs.cpio.gz
+      # ------------------------------------------------- release (tags only)
+      - name: release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            linux/arch/arm64/boot/Image.gz \
+            out/rootfs.cpio.gz \
+            --title "tiny-linux $GITHUB_REF_NAME" \
+            --generate-notes

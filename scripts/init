@@ -1,0 +1,46 @@
+#!/bin/sh
+# /init — PID 1 inside the guest. Minimal: mounts, network, then a shell.
+
+BB=/bin/busybox
+
+# filesystems first — applets are invoked through $BB until symlinks exist
+$BB mount -t proc     proc     /proc
+$BB mount -t sysfs    sysfs    /sys
+$BB mount -t devtmpfs devtmpfs /dev 2>/dev/null || $BB mount -t tmpfs tmpfs /dev
+[ -c /dev/console ] || $BB mknod -m 600 /dev/console c 5 1
+[ -c /dev/null ]    || $BB mknod -m 666 /dev/null    c 1 3
+
+# if the kernel couldn't open /dev/console for us, reattach now
+exec 0</dev/console 1>/dev/console 2>&1
+
+$BB mkdir -p /dev/pts /dev/shm
+$BB mount -t devpts devpts /dev/pts 2>/dev/null || true
+$BB mount -t tmpfs  tmpfs  /dev/shm 2>/dev/null || true
+$BB mount -t tmpfs  tmpfs  /tmp      2>/dev/null || true
+
+# applet symlinks (busybox --install needs /proc for /proc/self/exe)
+$BB --install -s /bin
+PATH=/bin
+export PATH
+
+hostname tiny 2>/dev/null || true
+ip link set lo up 2>/dev/null || ifconfig lo up 2>/dev/null || true
+
+# DHCP in the background — QEMU user networking hands out 10.0.2.15
+if [ -e /sys/class/net/eth0 ]; then
+    ( udhcpc -i eth0 -n -t 4 -T 2 ) >/dev/null 2>&1 &
+fi
+
+# quieter console from here on
+echo 4 > /proc/sys/kernel/printk 2>/dev/null || true
+
+mem=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
+echo
+echo "  tiny-linux (aarch64 virt)  MemTotal: ${mem} kB"
+echo "  quit QEMU: Ctrl-A x    monitor: Ctrl-A c  (try 'balloon 128M' there)"
+echo "  poweroff: poweroff -f"
+echo "  watch host RSS shrink: dd if=/dev/zero of=/tmp/junk bs=1M count=100; rm /tmp/junk"
+echo
+
+# shell on the console, with working Ctrl-C
+exec setsid cttyhack /bin/sh || exec /bin/sh
