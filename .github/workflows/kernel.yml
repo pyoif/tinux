@@ -21,7 +21,7 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y -q \
             bc bison flex libelf-dev libssl-dev \
-            clang lld \
+            clang lld llvm \
             gcc-aarch64-linux-gnu \
             cpio file qemu-system-arm
 
