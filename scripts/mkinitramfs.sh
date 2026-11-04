@@ -21,6 +21,7 @@ mkdir -p "$root"/bin "$root"/sbin "$root"/etc "$root"/proc "$root"/sys \
          "$root"/usr/share/udhcpc
 
 install -m 0755 "$busybox"                    "$root/bin/busybox"
+ln -sf busybox                                "$root/bin/sh"
 install -m 0755 "$here/init"                  "$root/init"
 install -m 0755 "$here/udhcpc.script"         "$root/usr/share/udhcpc/default.script"
 

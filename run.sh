@@ -9,7 +9,10 @@
 set -eu
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
-KERNEL="$DIR/Image.gz"
+# release artifacts are per-variant: Image-virt-tiny.gz / Image-distro.gz
+KERNEL="$DIR/Image-distro.gz"
+[ -f "$KERNEL" ] || KERNEL="$DIR/Image-virt-tiny.gz"
+[ -f "$KERNEL" ] || KERNEL="$DIR/Image.gz"
 INITRD="$DIR/rootfs.cpio.gz"
 
 command -v qemu-system-aarch64 >/dev/null 2>&1 || {
