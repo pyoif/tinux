@@ -1,0 +1,39 @@
+#!/bin/sh
+# /etc/init.d/rcS — one-shot setup, runs before the console shell.
+# (The console IS the terminal: QEMU is started with -nographic.)
+
+mount -t devtmpfs devtmpfs /dev
+mount -t proc     proc     /proc
+mount -t sysfs    sysfs    /sys
+mkdir -p /dev/pts /mnt/host /run
+mount -t devpts devpts /dev/pts 2>/dev/null || true
+mount -t tmpfs  tmpfs  /run      2>/dev/null || true
+
+echo tinyvm > /proc/sys/kernel/hostname 2>/dev/null || true
+
+# Network: QEMU user-mode NAT (guest gets 10.0.2.15 via DHCP).
+ifconfig lo up 2>/dev/null
+if [ -e /sys/class/net/eth0 ]; then
+  if udhcpc -s /etc/udhcpc.script -i eth0 -q -n -t 5 >/dev/null 2>&1; then
+    echo "NET-OK: $(ifconfig eth0 2>/dev/null | grep -o 'inet addr:[0-9.]*')"
+  else
+    echo "NET-SKIP: DHCP failed"
+  fi
+else
+  echo "NET-SKIP: no virtio-net device attached"
+fi
+
+# Host folder shared over 9p (see scripts/boot.sh: SHARE dir -> /mnt/host).
+if grep -qw 9p /proc/filesystems 2>/dev/null; then
+  if mount -t 9p -o trans=virtio,version=9p2000.L host /mnt/host 2>/dev/null; then
+    echo "9P-OK: host share mounted at /mnt/host"
+  else
+    echo "9P-SKIP: no host share attached"
+  fi
+fi
+
+echo
+echo "  tinyvm $(uname -r) | aarch64 | $(free 2>/dev/null | sed -n '2p' | awk '{print $2}')K RAM"
+echo "  /mnt/host = shared folder   poweroff = clean exit"
+echo
+echo "BOOT-OK"

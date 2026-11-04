@@ -1,0 +1,93 @@
+name: kernel
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      kernel_branch:
+        description: "Linux stable branch to build"
+        default: "linux-6.12.y"
+        type: string
+
+env:
+  KERNEL_BRANCH: ${{ inputs.kernel_branch || 'linux-6.12.y' }}
+  BUSYBOX_VERSION: "1.36.1"
+
+jobs:
+  build:
+    name: tiny aarch64 kernel + initramfs
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q \
+            bison flex bc libelf-dev libssl-dev cpio \
+            clang lld gcc-aarch64-linux-gnu \
+            qemu-system-arm
+
+      - name: Fetch Linux source (shallow)
+        run: |
+          git clone --depth 1 --branch "$KERNEL_BRANCH" \
+            https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git linux
+          # If kernel.org is slow from the runner, the GitHub mirror works too:
+          # git clone --depth 1 --branch "$KERNEL_BRANCH" https://github.com/gregkh/linux linux
+
+      - name: Configure kernel
+        working-directory: linux
+        run: |
+          make ARCH=arm64 LLVM=1 tinyconfig
+          scripts/kconfig/merge_config.sh -m .config ../kernel/virt-tiny.config
+          make ARCH=arm64 LLVM=1 olddefconfig
+          # Fail loudly if any requested option was dropped (missing dependency)
+          ../scripts/check-fragment.sh .config ../kernel/virt-tiny.config
+
+      - name: Build kernel
+        working-directory: linux
+        run: make ARCH=arm64 LLVM=1 -j"$(nproc)" Image.gz
+
+      - name: Build busybox initramfs
+        run: ./rootfs/build-initramfs.sh
+
+      - name: Smoke test - boot the VM on the runner
+        timeout-minutes: 5
+        run: |
+          mkdir -p /tmp/share && echo hello-from-host > /tmp/share/hello.txt
+          set -o pipefail
+          # -k 5: KILL if qemu hangs on shutdown after SIGTERM
+          timeout -k 5 90 qemu-system-aarch64 \
+            -machine virt -cpu max -smp 2 -m 256M \
+            -kernel linux/arch/arm64/boot/Image.gz \
+            -initrd rootfs/initramfs.cpio.gz \
+            -append "console=ttyAMA0 panic=-1" \
+            -netdev user,id=n0 \
+            -device virtio-net-device,netdev=n0 \
+            -fsdev local,id=fs0,path=/tmp/share,security_model=none \
+            -device virtio-9p-device,fsdev=fs0,mount_tag=host \
+            -device virtio-balloon-device,free-page-reporting=on \
+            -no-reboot -nographic | tee boot.log || true
+          grep -q "BOOT-OK" boot.log
+          grep -q "NET-OK" boot.log
+          grep -q "9P-OK" boot.log
+          ! grep -q "Kernel panic" boot.log
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-linux-tiny
+          path: |
+            linux/arch/arm64/boot/Image.gz
+            rootfs/initramfs.cpio.gz
+            linux/.config
+
+      - name: Attach to release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            linux/arch/arm64/boot/Image.gz
+            rootfs/initramfs.cpio.gz

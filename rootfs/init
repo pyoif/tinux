@@ -1,0 +1,5 @@
+#!/bin/sh
+# /init — PID 1. Hands over to busybox init, which reads /etc/inittab
+# and respawns the console shell if it ever exits.
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+exec /bin/busybox init

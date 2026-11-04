@@ -1,0 +1,11 @@
+# build outputs
+rootfs/build/
+rootfs/initramfs.cpio.gz
+
+# local kernel checkout used for development
+linux/
+
+# where the CI artifact gets unzipped
+vm/
+
+boot.log

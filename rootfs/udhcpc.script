@@ -1,0 +1,19 @@
+#!/bin/sh
+# /etc/udhcpc.script — event handler invoked by udhcpc (busybox DHCP client).
+case "$1" in
+  bound|renew)
+    ifconfig "$interface" "$ip" netmask "${subnet:-255.255.255.0}"
+    if [ -n "${router:-}" ]; then
+      route del default 2>/dev/null
+      route add default gw "$router" 2>/dev/null
+    fi
+    if [ -n "${dns:-}" ]; then
+      : > /etc/resolv.conf
+      for d in $dns; do echo "nameserver $d" >> /etc/resolv.conf; break; done
+    fi
+    ;;
+  deconfig)
+    ifconfig "$interface" 0.0.0.0
+    ;;
+esac
+exit 0
